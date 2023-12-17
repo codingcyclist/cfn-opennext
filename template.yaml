@@ -1,0 +1,351 @@
+Transform: "AWS::Serverless-2016-10-31"
+
+Parameters:
+  DomainName:
+    Type: String
+  RevalidationFunctionTimeout:
+    Type: Number
+    Default: 300
+Resources:
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${DomainName}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: "Enabled"
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods:
+              - "PUT"
+              - "POST"
+              - "DELETE"
+              - "GET"
+              - "HEAD"
+            AllowedOrigins:
+              - "*"
+            AllowedHeaders:
+              - "*"
+            ExposedHeaders:
+              - "x-amz-server-side-encryption"
+              - "x-amz-request-id"
+              - "x-amz-id-2"
+              - "x-amz-meta-original_width"
+              - "x-amz-meta-original_height"
+              - "x-amz-meta-width"
+              - "x-amz-meta-height"
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AssetsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontReadAccess
+            Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${AssetsBucket}/*"
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+  CloudFrontAccessToS3Bucket:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${DomainName}-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  RevalidationTable: 
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${DomainName}-revalidation-table
+      AttributeDefinitions:
+        - AttributeName: "tag"
+          AttributeType: "S"
+        - AttributeName: path
+          AttributeType: "S"
+        - AttributeName: "revalidatedAt"
+          AttributeType: "N"
+      KeySchema:
+        - AttributeName: "tag"
+          KeyType: "HASH"  # partition key
+        - AttributeName: "path"
+          KeyType: "RANGE"  # sort key
+      GlobalSecondaryIndexes: 
+        - IndexName: "revalidate"
+          KeySchema: 
+            - AttributeName: "path"
+              KeyType: "HASH"  # partition key
+            - AttributeName: "revalidatedAt"
+              KeyType: "RANGE"  # sort key
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+      SSESpecification:
+        SSEEnabled: true
+      TableClass: STANDARD
+      BillingMode: PAY_PER_REQUEST
+  RevalidationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${DomainName}-revalidation-queue.fifo
+      ContentBasedDeduplication: true
+      DeduplicationScope: messageGroup
+      FifoQueue: true
+      FifoThroughputLimit: perMessageGroupId
+      MessageRetentionPeriod: 120
+      VisibilityTimeout: !Ref RevalidationFunctionTimeout
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowCloudWatch
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: logs:*
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: AllowS3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub "arn:aws:s3:::${AssetsBucket}/*"
+              - Effect: Allow
+                Action:
+                  - "s3:ListObjects"
+                Resource:
+                  - !Sub "arn:aws:s3:::${AssetsBucket}"
+        - PolicyName: AllowSQS
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "sqs:SendMessage"
+                  - "sqs:ReceiveMessage"
+                  - "sqs:DeleteMessage"
+                  - "sqs:GetQueueAttributes"
+                Resource:
+                  - !GetAtt "RevalidationQueue.Arn"
+        - PolicyName: AllowDDB
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:PutItem"
+                Resource:
+                  - !GetAtt "RevalidationTable.Arn"
+  ServerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub server-${DomainName}
+      Description: Server Lambda for Next.js App
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Architectures: [arm64]
+      MemorySize: 512
+      CodeUri: .open-next/zips/server-function.zip
+      Role: !GetAtt LambdaExecutionRole.Arn
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: BUFFERED
+        Cors:
+          AllowMethods:
+            - GET
+            - HEAD
+          AllowOrigins:
+            - "*"
+          AllowHeaders:
+            - Access
+      # optional
+      Tracing: Active
+      Timeout: 300
+      Environment:
+        Variables:
+          CACHE_BUCKET_NAME: !Ref AssetsBucket
+          CACHE_BUCKET_KEY_PREFIX: cache
+          CACHE_BUCKET_REGION: !Ref "AWS::Region"
+          CACHE_DYNAMO_TABLE: !Ref RevalidationTable
+          REVALIDATION_QUEUE_URL: !Ref RevalidationQueue
+          REVALIDATION_QUEUE_REGION: !Ref "AWS::Region"
+  ImageOptimizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub img-optimizer-${DomainName}
+      Description: Image Optimization Lambda for Next.js App
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Architectures: [arm64]
+      MemorySize: 1024
+      CodeUri: .open-next/zips/image-optimization-function.zip
+      Role: !GetAtt LambdaExecutionRole.Arn
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: BUFFERED
+        Cors:
+          AllowMethods:
+            - GET
+            - HEAD
+          AllowOrigins:
+            - "*"
+          AllowHeaders:
+            - Access
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref AssetsBucket
+      # optional
+      Tracing: Active
+      Timeout: 300
+  RevalidationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub revalidator-${DomainName}
+      Description: Revalidation Lambda for Next.js App
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Architectures: [arm64]
+      MemorySize: 1024
+      CodeUri: .open-next/zips/revalidation-function.zip
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            BatchSize: 1
+            Enabled: true
+            Queue: !GetAtt RevalidationQueue.Arn
+      # optional
+      Tracing: Active
+      Timeout: !Ref RevalidationFunctionTimeout
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        PriceClass: PriceClass_100
+        IPV6Enabled: true
+        Origins:
+          - Id: !Sub ${DomainName}-static-assets-origin
+            DomainName: !GetAtt AssetsBucket.DomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt CloudFrontAccessToS3Bucket.Id
+          - Id: !Sub ${DomainName}-img-optimization-function-origin
+            # Remove https:// from URL; also, see: https://www.richdevelops.dev/functionurl-does-not-exist
+            DomainName: !Select [2, !Split ["/", !GetAtt ImageOptimizerFunctionUrl.FunctionUrl]]
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+          - Id: !Sub ${DomainName}-server-function-origin
+            # Remove https:// from URL; also, see: https://www.richdevelops.dev/functionurl-does-not-exist
+            DomainName: !Select [2, !Split ["/", !GetAtt ServerFunctionUrl.FunctionUrl]]
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+        # We need a "failover" Origin Group to try the "Server function" origin first, then fallback to the S3 bucket origin if the server function fails
+        OriginGroups:
+          Quantity: 1
+          Items:
+            - Id: !Sub ${DomainName}-server-and-static-origin-group
+              FailoverCriteria:
+                StatusCodes:
+                  Quantity: 2
+                  # TODO: Not sure if these are the correct error codes to use...
+                  Items:
+                    - 500
+                    - 502
+              Members:
+                Quantity: 2
+                Items:
+                  - OriginId: !Sub ${DomainName}-server-function-origin
+                  - OriginId: !Sub ${DomainName}-static-assets-origin
+        DefaultCacheBehavior:
+          MinTTL: 0
+          DefaultTTL: 0
+          MaxTTL: 31536000
+          TargetOriginId: !Sub ${DomainName}-server-and-static-origin-group
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - "HEAD"
+            - "GET"
+            - "OPTIONS"
+          CachedMethods:
+            - "HEAD"
+            - "GET"
+          Compress: true
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: "all"
+            Headers:
+              - x-op-middleware-request-headers
+              - x-op-middleware-response-headers
+              - x-nextjs-data
+              - x-middleware-prefetch
+        CacheBehaviors:
+          - TargetOriginId: !Sub ${DomainName}-static-assets-origin
+            ViewerProtocolPolicy: https-only
+            PathPattern: /_next/static/*
+            Compress: true
+            AllowedMethods: ["GET", "HEAD", "OPTIONS"]
+            CachedMethods: ["HEAD", "GET"]
+            ForwardedValues:
+              QueryString: false
+          - TargetOriginId: !Sub ${DomainName}-server-function-origin
+            ViewerProtocolPolicy: https-only
+            PathPattern: /api/*
+            AllowedMethods:
+              ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+            ForwardedValues:
+              QueryString: true
+              Cookies:
+                Forward: all
+              Headers: ["Authorization", "Host", "Accept-Language"]
+          - TargetOriginId: !Sub ${DomainName}-img-optimization-function-origin
+            ViewerProtocolPolicy: https-only
+            PathPattern: /_next/image
+            AllowedMethods:
+              ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+            ForwardedValues:
+              QueryString: true
+              Headers: ["Accept"]
+          - TargetOriginId: !Sub ${DomainName}-server-function-origin
+            ViewerProtocolPolicy: https-only
+            PathPattern: /_next/data/*
+            AllowedMethods: ["GET", "HEAD"]
+            ForwardedValues:
+              QueryString: true
+              Cookies:
+                Forward: all
+              Headers:
+                - x-op-middleware-request-headers
+                - x-op-middleware-response-headers
+                - x-nextjs-data
+                - x-middleware-prefetch
+Outputs:
+  cloudFrontDistributionUrl:
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  cloudFrontDistributionId:
+    Value: !Ref CloudFrontDistribution
