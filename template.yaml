@@ -3,14 +3,25 @@ Transform: "AWS::Serverless-2016-10-31"
 Parameters:
   DomainName:
     Type: String
+  LogsRetentionDays:
+    Type: Number
+    Default: 30
   RevalidationFunctionTimeout:
     Type: Number
     Default: 300
 Resources:
+  AssetsBucketName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub asset-bucket-${DomainName}
+      Description: !Sub Name of the bucket where all static assets of ${DomainName} are stored
+      Tier: Standard # standard parameters are free of charge
+      Type: String
+      Value: !Ref DomainName
   AssetsBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub ${DomainName}
+      BucketName: !Ref AssetsBucketName
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -62,7 +73,7 @@ Resources:
         OriginAccessControlOriginType: s3
         SigningBehavior: always
         SigningProtocol: sigv4
-  RevalidationTable: 
+  RevalidationTable:
     Type: AWS::DynamoDB::Table
     Properties:
       TableName: !Sub ${DomainName}-revalidation-table
@@ -75,16 +86,16 @@ Resources:
           AttributeType: "N"
       KeySchema:
         - AttributeName: "tag"
-          KeyType: "HASH"  # partition key
+          KeyType: "HASH" # partition key
         - AttributeName: "path"
-          KeyType: "RANGE"  # sort key
-      GlobalSecondaryIndexes: 
+          KeyType: "RANGE" # sort key
+      GlobalSecondaryIndexes:
         - IndexName: "revalidate"
-          KeySchema: 
+          KeySchema:
             - AttributeName: "path"
-              KeyType: "HASH"  # partition key
+              KeyType: "HASH" # partition key
             - AttributeName: "revalidatedAt"
-              KeyType: "RANGE"  # sort key
+              KeyType: "RANGE" # sort key
           Projection:
             ProjectionType: ALL
       PointInTimeRecoverySpecification:
@@ -129,13 +140,14 @@ Resources:
                 Action:
                   - "s3:GetObject"
                   - "s3:PutObject"
+                  - "s3:DeleteObject"
                 Resource:
-                  - !Sub "arn:aws:s3:::${AssetsBucket}/*"
+                  - !Sub "arn:aws:s3:::${AssetsBucketName}/*"
               - Effect: Allow
                 Action:
-                  - "s3:ListObjects"
+                  - "s3:ListBucket"
                 Resource:
-                  - !Sub "arn:aws:s3:::${AssetsBucket}"
+                  - !Sub "arn:aws:s3:::${AssetsBucketName}"
         - PolicyName: AllowSQS
           PolicyDocument:
             Version: "2012-10-17"
@@ -166,7 +178,7 @@ Resources:
       Runtime: nodejs18.x
       Architectures: [arm64]
       MemorySize: 512
-      CodeUri: .open-next/zips/server-function.zip
+      CodeUri: services/next-app/.open-next/zips/server-function.zip
       Role: !GetAtt LambdaExecutionRole.Arn
       FunctionUrlConfig:
         AuthType: NONE
@@ -184,12 +196,17 @@ Resources:
       Timeout: 300
       Environment:
         Variables:
-          CACHE_BUCKET_NAME: !Ref AssetsBucket
+          CACHE_BUCKET_NAME: !Ref AssetsBucketName
           CACHE_BUCKET_KEY_PREFIX: cache
           CACHE_BUCKET_REGION: !Ref "AWS::Region"
           CACHE_DYNAMO_TABLE: !Ref RevalidationTable
           REVALIDATION_QUEUE_URL: !Ref RevalidationQueue
           REVALIDATION_QUEUE_REGION: !Ref "AWS::Region"
+  ServerFunctionLogs:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ServerFunction}"
+      RetentionInDays: !Ref LogsRetentionDays
   ImageOptimizerFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -199,7 +216,7 @@ Resources:
       Runtime: nodejs18.x
       Architectures: [arm64]
       MemorySize: 1024
-      CodeUri: .open-next/zips/image-optimization-function.zip
+      CodeUri: services/next-app/.open-next/zips/image-optimization-function.zip
       Role: !GetAtt LambdaExecutionRole.Arn
       FunctionUrlConfig:
         AuthType: NONE
@@ -214,10 +231,15 @@ Resources:
             - Access
       Environment:
         Variables:
-          BUCKET_NAME: !Ref AssetsBucket
+          BUCKET_NAME: !Ref AssetsBucketName
       # optional
       Tracing: Active
       Timeout: 300
+  ImageOptimizerFunctionLogs:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ImageOptimizerFunction}"
+      RetentionInDays: !Ref LogsRetentionDays
   RevalidationFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -227,7 +249,7 @@ Resources:
       Runtime: nodejs18.x
       Architectures: [arm64]
       MemorySize: 1024
-      CodeUri: .open-next/zips/revalidation-function.zip
+      CodeUri: services/next-app/.open-next/zips/revalidation-function.zip
       Role: !GetAtt LambdaExecutionRole.Arn
       Events:
         SQSEvent:
@@ -239,6 +261,44 @@ Resources:
       # optional
       Tracing: Active
       Timeout: !Ref RevalidationFunctionTimeout
+  RevalidationFunctionLogs:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${RevalidationFunction}"
+      RetentionInDays: !Ref LogsRetentionDays
+  ResizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub resizer-${DomainName}
+      Handler: app.handler
+      CodeUri: services/resizer/app.py # no requirements.txt required. All dependencies in layers
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:770693421928:layer:Klayers-p311-Pillow:1
+        - !Sub arn:aws:lambda:${AWS::Region}:770693421928:layer:Klayers-p311-aws-xray-sdk:3
+        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV2:58
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      MemorySize: 1024
+      Tracing: Active
+      Timeout: 300
+      Events:
+        S3Bucket:
+          Type: S3
+          Properties:
+            Bucket: !Ref AssetsBucket
+            Events:
+              - "s3:ObjectCreated:*"
+              - "s3:ObjectRemoved:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: assets
+  ResizerFunctionLogs:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ResizerFunction}"
+      RetentionInDays: !Ref LogsRetentionDays
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -254,13 +314,18 @@ Resources:
             OriginAccessControlId: !GetAtt CloudFrontAccessToS3Bucket.Id
           - Id: !Sub ${DomainName}-img-optimization-function-origin
             # Remove https:// from URL; also, see: https://www.richdevelops.dev/functionurl-does-not-exist
-            DomainName: !Select [2, !Split ["/", !GetAtt ImageOptimizerFunctionUrl.FunctionUrl]]
+            DomainName:
+              !Select [
+                2,
+                !Split ["/", !GetAtt ImageOptimizerFunctionUrl.FunctionUrl],
+              ]
             CustomOriginConfig:
               HTTPSPort: 443
               OriginProtocolPolicy: https-only
           - Id: !Sub ${DomainName}-server-function-origin
             # Remove https:// from URL; also, see: https://www.richdevelops.dev/functionurl-does-not-exist
-            DomainName: !Select [2, !Split ["/", !GetAtt ServerFunctionUrl.FunctionUrl]]
+            DomainName:
+              !Select [2, !Split ["/", !GetAtt ServerFunctionUrl.FunctionUrl]]
             CustomOriginConfig:
               HTTPSPort: 443
               OriginProtocolPolicy: https-only
@@ -308,6 +373,14 @@ Resources:
           - TargetOriginId: !Sub ${DomainName}-static-assets-origin
             ViewerProtocolPolicy: https-only
             PathPattern: /_next/static/*
+            Compress: true
+            AllowedMethods: ["GET", "HEAD", "OPTIONS"]
+            CachedMethods: ["HEAD", "GET"]
+            ForwardedValues:
+              QueryString: false
+          - TargetOriginId: !Sub ${DomainName}-static-assets-origin
+            ViewerProtocolPolicy: https-only
+            PathPattern: /assets/*
             Compress: true
             AllowedMethods: ["GET", "HEAD", "OPTIONS"]
             CachedMethods: ["HEAD", "GET"]
