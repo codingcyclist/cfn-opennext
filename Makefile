@@ -13,6 +13,6 @@ upsert-stack:
 		--stack-name ${DOMAIN_NAME} \
 		--region eu-central-1 \
 		--capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND CAPABILITY_NAMED_IAM && \
-	aws s3 sync --delete .open-next/assets s3://${DOMAIN_NAME} --cache-control public,max-age=0,s-maxage=31536000,must-revalidate && \
-	aws s3 sync --delete .open-next/assets/_next s3://${DOMAIN_NAME}/_next --cache-control public,max-age=31536000,immutable && \
-	aws s3 sync --delete .open-next/cache s3://${DOMAIN_NAME}/cache
+	aws s3 sync --delete services/next-app/.open-next/assets s3://asset-bucket-${DOMAIN_NAME} --cache-control public,max-age=0,s-maxage=31536000,must-revalidate && \
+	aws s3 sync --delete services/next-app/.open-next/assets/_next s3://asset-bucket-${DOMAIN_NAME}/_next --cache-control public,max-age=31536000,immutable && \
+	aws s3 sync --delete services/next-app/.open-next/cache s3://asset-bucket-${DOMAIN_NAME}/cache
